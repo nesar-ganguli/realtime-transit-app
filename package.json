@@ -13,6 +13,7 @@
     "@react-navigation/native": "^7.2.2",
     "axios": "^1.15.0",
     "expo": "~54.0.33",
+    "expo-notifications": "~0.32.16",
     "expo-status-bar": "~3.0.9",
     "pbf": "^4.0.1",
     "protobufjs": "^8.0.1",

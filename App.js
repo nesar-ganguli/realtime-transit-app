@@ -6,9 +6,19 @@ import {
 } from "react-native";
 import MapView, { Circle, Marker, Polyline } from "react-native-maps";
 
+import * as Notifications from "expo-notifications";
 import { routes, routesById, stops, stopsById, tripRouteById } from "./src/services/gtfsStatic";
 import stopMarkerImages from "./src/generated/stopMarkerImages";
 import { startRealtimePolling } from "./src/services/gtfsRealtime";
+import { haversine } from "./src/utils/distance";
+
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowAlert: true,
+    shouldPlaySound: true,
+    shouldSetBadge: false,
+  }),
+});
 
 const { height: screenHeight } = Dimensions.get("window");
 
@@ -40,6 +50,38 @@ export default function App() {
   const [selectedIds, setSelectedIds] = useState([]);
   const [vehicles, setVehicles] = useState([]);
   const [activeBusId, setActiveBusId] = useState(null);
+  const [alertDistance, setAlertDistance] = useState(500);
+  const firedAlerts = useRef(new Set());
+
+  useEffect(() => {
+    Notifications.requestPermissionsAsync();
+  }, []);
+
+  useEffect(() => {
+    if (!visibleVehicles.length || !selectedStops.length) return;
+    visibleVehicles.forEach(v => {
+      selectedStops.forEach(stop => {
+        const dist = haversine(v.lat, v.lon, stop.lat, stop.lon);
+        if (dist > alertDistance) return;
+        const key = `${v.id}-${stop.id}`;
+        if (firedAlerts.current.has(key)) return;
+        firedAlerts.current.add(key);
+        const route = routesById[v.routeId];
+        Notifications.scheduleNotificationAsync({
+          content: {
+            title: `Bus approaching ${stop.name}`,
+            body: `Route ${route?.shortName ?? v.routeId} is ${Math.round(dist)}m away.`,
+          },
+          trigger: null,
+        });
+        setTimeout(() => firedAlerts.current.delete(key), 2 * 60 * 1000);
+      });
+    });
+  }, [visibleVehicles, selectedStops, alertDistance]);
+
+  useEffect(() => {
+    firedAlerts.current = new Set();
+  }, [selectedIds]);
 
   useEffect(() => {
     return startRealtimePolling({
@@ -284,6 +326,24 @@ export default function App() {
               </View>
 
               <View style={styles.panel}>
+                <Text style={styles.panelTitle}>Arrival alerts</Text>
+                <Text style={styles.alertBody}>Notify me when a bus is within:</Text>
+                <View style={styles.distanceRow}>
+                  {[250, 500, 1000, 2000].map(d => (
+                    <Pressable
+                      key={d}
+                      onPress={() => setAlertDistance(d)}
+                      style={[styles.distanceBtn, alertDistance === d && styles.distanceBtnActive]}
+                    >
+                      <Text style={[styles.distanceBtnText, alertDistance === d && styles.distanceBtnTextActive]}>
+                        {d >= 1000 ? `${d / 1000}km` : `${d}m`}
+                      </Text>
+                    </Pressable>
+                  ))}
+                </View>
+              </View>
+
+              <View style={styles.panel}>
                 <Text style={styles.panelTitle}>Service alerts</Text>
                 <View style={styles.alertBox}>
                   <Text style={styles.alertTitle}>All clear</Text>
@@ -430,4 +490,13 @@ const styles = StyleSheet.create({
   alertBox: { backgroundColor: "#f8fafc", borderRadius: 18, padding: 14 },
   alertTitle: { color: "#0f172a", fontSize: 15, fontWeight: "700", marginBottom: 5 },
   alertBody: { color: "#64748b", fontSize: 13, lineHeight: 19 },
+  distanceRow: { flexDirection: "row", gap: 8, marginTop: 12 },
+  distanceBtn: {
+    flex: 1, paddingVertical: 8, borderRadius: 999,
+    borderWidth: 1, borderColor: "#e2e8f0",
+    alignItems: "center",
+  },
+  distanceBtnActive: { backgroundColor: "#0f172a", borderColor: "#0f172a" },
+  distanceBtnText: { fontSize: 13, fontWeight: "600", color: "#334155" },
+  distanceBtnTextActive: { color: "#f8fafc" },
 });
