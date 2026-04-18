@@ -92,6 +92,8 @@ const readVehiclePosition = (tag, vehicle, pbf) => {
     vehicle.stopId = pbf.readString();
   } else if (tag === 8) {
     vehicle.vehicle = pbf.readMessage(readVehicleDescriptor, {});
+  } else if (tag === 9) {
+    vehicle.occupancyStatus = pbf.readVarint();
   }
 };
 
@@ -163,6 +165,15 @@ const readTranslation = (tag, translation, pbf) => {
   }
 };
 
+const flattenTranslatedText = (translatedList) => {
+  const texts = (translatedList ?? [])
+    .flatMap((item) => item?.translation ?? [])
+    .map((item) => item?.text?.trim())
+    .filter(Boolean);
+
+  return texts[0] ?? null;
+};
+
 const minutesLabel = (seconds) => {
   if (!Number.isFinite(seconds)) {
     return null;
@@ -192,6 +203,48 @@ const normalizeDelayStatus = (delaySeconds, stopStatus) => {
   return 'ON_TIME';
 };
 
+const occupancyLabel = (value) => {
+  if (!Number.isFinite(value)) {
+    return 'No data';
+  }
+
+  const labels = {
+    0: 'Empty',
+    1: 'Many seats',
+    2: 'Few seats',
+    3: 'Standing room',
+    4: 'Crushed standing',
+    5: 'Full',
+    6: 'Not accepting riders',
+    7: 'No data',
+    8: 'Not boardable',
+  };
+
+  return labels[value] ?? 'No data';
+};
+
+const addDelayToClock = (time, delaySeconds) => {
+  if (!time) {
+    return null;
+  }
+
+  const [hh, mm, ss] = time.split(':').map(Number);
+  if (![hh, mm, ss].every(Number.isFinite)) {
+    return null;
+  }
+
+  const total = hh * 3600 + mm * 60 + ss + (Number.isFinite(delaySeconds) ? delaySeconds : 0);
+  const wrapped = ((total % 86400) + 86400) % 86400;
+  const hours = Math.floor(wrapped / 3600);
+  const minutes = Math.floor((wrapped % 3600) / 60);
+  const suffix = hours >= 12 ? 'PM' : 'AM';
+  const displayHour = hours % 12 || 12;
+
+  return `${String(displayHour).padStart(2, '0')}:${String(minutes).padStart(2, '0')}${suffix}`;
+};
+
+const formatClock = (time) => addDelayToClock(time, 0);
+
 const normalizeTripUpdates = (tripFeed) => {
   const byTripId = {};
 
@@ -214,13 +267,66 @@ const normalizeTripUpdates = (tripFeed) => {
       etaToNextStop: Number.isFinite(arrivalTime)
         ? minutesLabel(arrivalTime - Math.floor(Date.now() / 1000))
         : null,
+      stopUpdates:
+        tripUpdate.stopTimeUpdate?.map((update) => ({
+          stopId: update.stopId ?? null,
+          delaySeconds: Number(
+            update?.arrival?.delay ?? update?.departure?.delay ?? delaySeconds
+          ),
+          estimatedEpoch: Number(update?.arrival?.time ?? update?.departure?.time),
+        })) ?? [],
     };
   }
 
   return byTripId;
 };
 
-const normalizeVehicles = ({ positionsFeed, tripFeed, stopsById, tripRouteById }) => {
+const buildUpcomingStops = ({ tripId, nextStopId, tripStopTimesByTripId, tripUpdate, stopsById }) => {
+  const stopTimes = tripStopTimesByTripId?.[tripId] ?? [];
+  if (!stopTimes.length) {
+    return [];
+  }
+
+  const updateByStopId = Object.fromEntries(
+    (tripUpdate?.stopUpdates ?? [])
+      .filter((update) => update.stopId)
+      .map((update) => [update.stopId, update])
+  );
+
+  let startIndex = 0;
+  if (nextStopId) {
+    const found = stopTimes.findIndex((stopTime) => stopTime.stopId === nextStopId);
+    if (found >= 0) {
+      startIndex = found;
+    }
+  }
+
+  return stopTimes.slice(startIndex, startIndex + 3).map((stopTime) => {
+    const live = updateByStopId[stopTime.stopId];
+    const estimatedTime = Number.isFinite(live?.estimatedEpoch)
+      ? new Date(live.estimatedEpoch * 1000).toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: true,
+        }).replace(/\s/g, '')
+      : addDelayToClock(stopTime.arrivalTime, live?.delaySeconds ?? tripUpdate?.delaySeconds ?? 0);
+
+    return {
+      stopId: stopTime.stopId,
+      stopName: stopsById[stopTime.stopId]?.name ?? stopTime.stopId,
+      scheduledTime: formatClock(stopTime.arrivalTime),
+      estimatedTime,
+    };
+  });
+};
+
+const normalizeVehicles = ({
+  positionsFeed,
+  tripFeed,
+  stopsById,
+  tripRouteById,
+  tripStopTimesByTripId,
+}) => {
   const tripUpdatesByTripId = normalizeTripUpdates(tripFeed);
 
   return (positionsFeed?.entity ?? [])
@@ -245,6 +351,13 @@ const normalizeVehicles = ({ positionsFeed, tripFeed, stopsById, tripRouteById }
       const nextStopId = vehicle?.stopId ?? tripUpdate?.nextStopId ?? null;
       const nextStop = nextStopId ? stopsById[nextStopId] : null;
       const delaySeconds = tripUpdate?.delaySeconds ?? null;
+      const upcomingStops = buildUpcomingStops({
+        tripId,
+        nextStopId,
+        tripStopTimesByTripId,
+        tripUpdate,
+        stopsById,
+      });
 
       return {
         id: vehicle?.vehicle?.label ?? vehicle?.vehicle?.id ?? entity.id ?? `vehicle-${index}`,
@@ -259,12 +372,14 @@ const normalizeVehicles = ({ positionsFeed, tripFeed, stopsById, tripRouteById }
         etaToNextStop: tripUpdate?.etaToNextStop ?? null,
         delaySeconds,
         status: normalizeDelayStatus(delaySeconds, vehicle?.currentStatus),
+        occupancyStatus: occupancyLabel(vehicle?.occupancyStatus),
+        upcomingStops,
       };
     })
     .filter(Boolean);
 };
 
-export const fetchRealtimeSnapshot = async ({ stopsById, tripRouteById }) => {
+export const fetchRealtimeSnapshot = async ({ stopsById, tripRouteById, tripStopTimesByTripId }) => {
   const [positionsBytes, tripBytes, alertBytes] = await Promise.all([
     fetchFeedBytes(POSITIONS),
     fetchFeedBytes(TRIPS),
@@ -274,16 +389,31 @@ export const fetchRealtimeSnapshot = async ({ stopsById, tripRouteById }) => {
   const positionsFeed = readFeedMessage(positionsBytes);
   const tripFeed = readFeedMessage(tripBytes);
   const alertsFeed = readFeedMessage(alertBytes);
-  const vehicles = normalizeVehicles({ positionsFeed, tripFeed, stopsById, tripRouteById });
+  const vehicles = normalizeVehicles({
+    positionsFeed,
+    tripFeed,
+    stopsById,
+    tripRouteById,
+    tripStopTimesByTripId,
+  });
+  const alerts = (alertsFeed?.entity ?? [])
+    .map((entity) => entity?.alert)
+    .filter(Boolean)
+    .map((alert) => {
+      const header = flattenTranslatedText(alert.headerText);
+      const body = flattenTranslatedText(alert.descriptionText);
+      return header || body ? [header, body].filter(Boolean).join(' - ') : null;
+    })
+    .filter(Boolean);
 
   return {
     vehicles,
-    alerts: alertsFeed?.entity ?? [],
+    alerts,
     fetchedAt: Date.now(),
     debug: {
       positionEntities: positionsFeed?.entity?.length ?? 0,
       tripEntities: tripFeed?.entity?.length ?? 0,
-      alertEntities: alertsFeed?.entity?.length ?? 0,
+      alertEntities: alerts.length,
       normalizedVehicles: vehicles.length,
       sampleRouteIds: [...new Set(vehicles.map((vehicle) => vehicle.routeId))].slice(0, 6),
     },
@@ -293,6 +423,7 @@ export const fetchRealtimeSnapshot = async ({ stopsById, tripRouteById }) => {
 export const startRealtimePolling = ({
   stopsById,
   tripRouteById,
+  tripStopTimesByTripId,
   onUpdate,
   onError,
   intervalMs = 10000,
@@ -301,7 +432,11 @@ export const startRealtimePolling = ({
 
   const tick = async () => {
     try {
-      const snapshot = await fetchRealtimeSnapshot({ stopsById, tripRouteById });
+      const snapshot = await fetchRealtimeSnapshot({
+        stopsById,
+        tripRouteById,
+        tripStopTimesByTripId,
+      });
       if (!cancelled) {
         onUpdate(snapshot);
       }

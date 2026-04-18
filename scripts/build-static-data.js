@@ -138,6 +138,8 @@ for (const row of stopTimesCsv) {
   stopTimesByTripId[tripId].push({
     stopId: row.stop_id,
     sequence: Number(row.stop_sequence),
+    arrivalTime: row.arrival_time || null,
+    departureTime: row.departure_time || null,
   });
 }
 
@@ -239,6 +241,17 @@ const tripRouteById = Object.fromEntries(
     .filter((trip) => trip.tripId && routeIdsInUse.has(trip.routeId))
     .map((trip) => [trip.tripId, trip.routeId])
 );
+const tripStopTimesByTripId = Object.fromEntries(
+  Object.entries(stopTimesByTripId).map(([tripId, stopTimes]) => [
+    tripId,
+    stopTimes.map((stopTime) => ({
+      stopId: stopTime.stopId,
+      sequence: stopTime.sequence,
+      arrivalTime: stopTime.arrivalTime,
+      departureTime: stopTime.departureTime,
+    })),
+  ])
+);
 
 const stops = Object.values(stopsById)
   .map((stop) => ({
@@ -252,7 +265,7 @@ const output = `export const routes = ${JSON.stringify(routes, null, 2)};\n\nexp
   stops,
   null,
 2
-)};\n\nexport const tripRouteById = ${JSON.stringify(tripRouteById, null, 2)};\n`;
+)};\n\nexport const tripRouteById = ${JSON.stringify(tripRouteById, null, 2)};\n\nexport const tripStopTimesByTripId = ${JSON.stringify(tripStopTimesByTripId, null, 2)};\n`;
 
 const outputDir = path.join(process.cwd(), 'src', 'generated');
 const outputFile = path.join(outputDir, 'gtfsStaticData.js');

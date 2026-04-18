@@ -4,21 +4,13 @@ import {
   Pressable, SafeAreaView, ScrollView, StatusBar,
   StyleSheet, Text, View,
 } from "react-native";
-import MapView, { Circle, Marker, Polyline } from "react-native-maps";
+import Constants from "expo-constants";
+import MapView, { Marker, Polyline } from "react-native-maps";
 
-import * as Notifications from "expo-notifications";
-import { routes, routesById, stops, stopsById, tripRouteById } from "./src/services/gtfsStatic";
+import { routes, routesById, stops, stopsById, tripRouteById, tripStopTimesByTripId } from "./src/services/gtfsStatic";
 import stopMarkerImages from "./src/generated/stopMarkerImages";
 import { startRealtimePolling } from "./src/services/gtfsRealtime";
 import { haversine } from "./src/utils/distance";
-
-Notifications.setNotificationHandler({
-  handleNotification: async () => ({
-    shouldShowAlert: true,
-    shouldPlaySound: true,
-    shouldSetBadge: false,
-  }),
-});
 
 const { height: screenHeight } = Dimensions.get("window");
 
@@ -34,6 +26,25 @@ const DEFAULT_REGION = {
   longitudeDelta: 0.06,
 };
 
+const TEST_ALERTS = [
+  "Demo alert: Route 2W is running 8 minutes behind schedule near downtown because of heavy traffic near Walnut Street and 11th Street, riders should expect rolling delays, temporary stop crowding, and minor schedule adjustments through the afternoon until normal service spacing is restored across the corridor.",
+];
+
+function formatAlertDistance(meters) {
+  if (!meters) return "Off";
+  return `${(meters * 0.000621371).toFixed(1)} mi`;
+}
+
+function vehicleKey(vehicle, index = 0) {
+  return [
+    vehicle?.id || "vehicle",
+    vehicle?.tripId || "trip",
+    vehicle?.routeId || "route",
+    vehicle?.lastUpdated || "time",
+    index,
+  ].join("-");
+}
+
 function canDraw(route) {
   if (!route) return false;
   if (route.shapeVariants?.some(s => s.length > 1)) return true;
@@ -45,20 +56,116 @@ export default function App() {
   const sheetY = useRef(new Animated.Value(SNAP_MID)).current;
   const dragStart = useRef(SNAP_MID);
   const userPickedRoute = useRef(false);
+  const notificationsRef = useRef(null);
+  const locationRef = useRef(null);
+  const locationWatcherRef = useRef(null);
 
   const [tab, setTab] = useState("routes");
   const [selectedIds, setSelectedIds] = useState([]);
   const [vehicles, setVehicles] = useState([]);
+  const [alerts, setAlerts] = useState([]);
   const [activeBusId, setActiveBusId] = useState(null);
+  const [popupBusId, setPopupBusId] = useState(null);
   const [alertDistance, setAlertDistance] = useState(500);
+  const [notificationsReady, setNotificationsReady] = useState(false);
+  const [alertExpanded, setAlertExpanded] = useState(false);
+  const [userLocation, setUserLocation] = useState(null);
+  const [mapHeading, setMapHeading] = useState(0);
   const firedAlerts = useRef(new Set());
 
   useEffect(() => {
-    Notifications.requestPermissionsAsync();
+    let cancelled = false;
+
+    (async () => {
+      if (Constants.appOwnership === "expo") {
+        setNotificationsReady(false);
+        notificationsRef.current = null;
+        return;
+      }
+
+      try {
+        const Notifications = await import("expo-notifications");
+        if (cancelled) return;
+
+        notificationsRef.current = Notifications;
+        Notifications.setNotificationHandler({
+          handleNotification: async () => ({
+            shouldShowAlert: true,
+            shouldPlaySound: true,
+            shouldSetBadge: false,
+          }),
+        });
+        await Notifications.requestPermissionsAsync();
+        if (!cancelled) {
+          setNotificationsReady(true);
+        }
+      } catch (error) {
+        notificationsRef.current = null;
+        if (!cancelled) {
+          setNotificationsReady(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
-    if (!visibleVehicles.length || !selectedStops.length) return;
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const Location = await import("expo-location");
+        if (cancelled) return;
+
+        locationRef.current = Location;
+
+        const permission = await Location.requestForegroundPermissionsAsync();
+        if (cancelled || permission.status !== "granted") {
+          return;
+        }
+
+        const current = await Location.getCurrentPositionAsync({
+          accuracy: Location.Accuracy.Balanced,
+        });
+
+        if (!cancelled) {
+          setUserLocation({
+            latitude: current.coords.latitude,
+            longitude: current.coords.longitude,
+          });
+        }
+
+        locationWatcherRef.current = await Location.watchPositionAsync(
+          {
+            accuracy: Location.Accuracy.Balanced,
+            timeInterval: 10000,
+            distanceInterval: 20,
+          },
+          (position) => {
+            if (cancelled) return;
+            setUserLocation({
+              latitude: position.coords.latitude,
+              longitude: position.coords.longitude,
+            });
+          }
+        );
+      } catch (error) {
+        locationRef.current = null;
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      locationWatcherRef.current?.remove?.();
+      locationWatcherRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!notificationsReady || !alertDistance || !visibleVehicles.length || !selectedStops.length) return;
     visibleVehicles.forEach(v => {
       selectedStops.forEach(stop => {
         const dist = haversine(v.lat, v.lon, stop.lat, stop.lon);
@@ -67,7 +174,7 @@ export default function App() {
         if (firedAlerts.current.has(key)) return;
         firedAlerts.current.add(key);
         const route = routesById[v.routeId];
-        Notifications.scheduleNotificationAsync({
+        notificationsRef.current?.scheduleNotificationAsync?.({
           content: {
             title: `Bus approaching ${stop.name}`,
             body: `Route ${route?.shortName ?? v.routeId} is ${Math.round(dist)}m away.`,
@@ -77,18 +184,29 @@ export default function App() {
         setTimeout(() => firedAlerts.current.delete(key), 2 * 60 * 1000);
       });
     });
-  }, [visibleVehicles, selectedStops, alertDistance]);
+  }, [notificationsReady, visibleVehicles, selectedStops, alertDistance]);
 
   useEffect(() => {
     firedAlerts.current = new Set();
   }, [selectedIds]);
 
   useEffect(() => {
+    setAlertExpanded(false);
+  }, [alerts]);
+
+  useEffect(() => {
     return startRealtimePolling({
       stopsById,
       tripRouteById,
-      onUpdate: ({ vehicles: v }) => { setVehicles(v); },
-      onError: () => { setVehicles([]); },
+      tripStopTimesByTripId,
+      onUpdate: ({ vehicles: v, alerts: nextAlerts }) => {
+        setVehicles(v);
+        setAlerts(nextAlerts ?? []);
+      },
+      onError: () => {
+        setVehicles([]);
+        setAlerts([]);
+      },
     });
   }, []);
 
@@ -119,16 +237,27 @@ export default function App() {
   }, [selectedIds, selectedRoutes, vehicles]);
 
   const activeBus = useMemo(() => {
-    return visibleVehicles.find(v => v.id === activeBusId) ?? visibleVehicles[0] ?? null;
+    return visibleVehicles.find((v, index) => vehicleKey(v, index) === activeBusId) ?? visibleVehicles[0] ?? null;
   }, [visibleVehicles, activeBusId]);
+
+  const popupBus = useMemo(() => {
+    return visibleVehicles.find((v, index) => vehicleKey(v, index) === popupBusId) ?? null;
+  }, [visibleVehicles, popupBusId]);
 
   useEffect(() => {
     if (!visibleVehicles.length) { setActiveBusId(null); return; }
     setActiveBusId(cur => {
-      const still = visibleVehicles.some(v => v.id === cur);
-      return still ? cur : (visibleVehicles[0]?.id ?? null);
+      const still = visibleVehicles.some((v, index) => vehicleKey(v, index) === cur);
+      return still ? cur : vehicleKey(visibleVehicles[0], 0);
     });
   }, [visibleVehicles]);
+
+  useEffect(() => {
+    if (!popupBusId) return;
+    if (!visibleVehicles.some((v, index) => vehicleKey(v, index) === popupBusId)) {
+      setPopupBusId(null);
+    }
+  }, [popupBusId, visibleVehicles]);
 
   useEffect(() => {
     if (!selectedRoutes.length) return;
@@ -196,6 +325,41 @@ export default function App() {
     selectedRoutes.map(r => r.id).sort().join("|") || "empty"
   , [selectedRoutes]);
 
+  const centerOnUser = () => {
+    if (!userLocation || !mapRef.current) return;
+
+    mapRef.current.animateToRegion({
+      latitude: userLocation.latitude,
+      longitude: userLocation.longitude,
+      latitudeDelta: 0.02,
+      longitudeDelta: 0.02,
+    }, 500);
+  };
+
+  const syncMapHeading = async () => {
+    if (!mapRef.current?.getCamera) return;
+
+    try {
+      const camera = await mapRef.current.getCamera();
+      setMapHeading(Number(camera?.heading) || 0);
+    } catch (error) {
+      // leave the last heading alone if camera lookup flakes
+    }
+  };
+
+  const resetNorth = () => {
+    if (!mapRef.current?.animateCamera) return;
+
+    mapRef.current.animateCamera(
+      {
+        heading: 0,
+      },
+      { duration: 350 }
+    );
+
+    setMapHeading(0);
+  };
+
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -208,6 +372,10 @@ export default function App() {
           style={styles.map}
           initialRegion={DEFAULT_REGION}
           showsCompass={false}
+          showsUserLocation={!!userLocation}
+          showsMyLocationButton={false}
+          onMapReady={syncMapHeading}
+          onRegionChangeComplete={syncMapHeading}
         >
           {shapes.map((s, i) => s.points.length ? (
             <Fragment key={`${s.routeId}-${i}`}>
@@ -234,12 +402,16 @@ export default function App() {
             );
           })}
 
-          {visibleVehicles.map(v => (
+          {visibleVehicles.map((v, index) => (
             <Marker
-              key={v.id}
+              key={vehicleKey(v, index)}
               coordinate={{ latitude: v.lat, longitude: v.lon }}
               title={v.nextStopName || "Bus"}
-              onPress={() => setActiveBusId(v.id)}
+              onPress={() => {
+                const key = vehicleKey(v, index);
+                setActiveBusId(key);
+                setPopupBusId(key);
+              }}
               anchor={{ x: 0.5, y: 0.5 }}
               flat
               rotation={v.bearing || 0}
@@ -251,23 +423,86 @@ export default function App() {
             </Marker>
           ))}
 
-          {activeBus && (
-            <Circle
-              center={{ latitude: activeBus.lat, longitude: activeBus.lon }}
-              radius={170}
-              fillColor="rgba(249,168,37,0.18)"
-              strokeColor="rgba(249,168,37,0.55)"
-            />
-          )}
         </MapView>
+
+        <Pressable
+          onPress={centerOnUser}
+          style={[styles.locateBtn, !userLocation && styles.locateBtnDisabled]}
+        >
+          <View style={styles.locateIcon}>
+            <View style={styles.locateIconRing} />
+            <View style={styles.locateIconDot} />
+          </View>
+        </Pressable>
+
+        <Pressable onPress={resetNorth} style={styles.compassBtn}>
+          <View style={styles.compassFace}>
+            <Animated.View
+              style={[
+                styles.compassNeedleWrap,
+                { transform: [{ rotate: `${mapHeading}deg` }] },
+              ]}
+            >
+              <View style={styles.compassNeedleNorth} />
+              <View style={styles.compassNeedleSouth} />
+            </Animated.View>
+            <Text style={styles.compassLabel}>N</Text>
+          </View>
+        </Pressable>
+
+        {popupBus ? (
+          <View style={styles.busPopup}>
+            <View style={[styles.busPopupHeader, { backgroundColor: `#${routesById[popupBus.routeId]?.color || "ef4444"}` }]}>
+              <View>
+                <Text style={styles.busPopupSubtitle}>
+                  {routesById[popupBus.routeId]?.shortName || popupBus.routeId} · {routesById[popupBus.routeId]?.longName || "Transit"}
+                </Text>
+              </View>
+              <Pressable onPress={() => setPopupBusId(null)} style={styles.busPopupClose}>
+                <Text style={styles.busPopupCloseText}>x</Text>
+              </Pressable>
+            </View>
+
+            <View style={styles.busPopupBody}>
+
+
+              <View style={styles.busPopupTableHead}>
+                <Text style={[styles.busPopupHeadCell, styles.busPopupStopCell]}>Stop</Text>
+                <Text style={styles.busPopupHeadCell}>Scheduled</Text>
+                <Text style={styles.busPopupHeadCell}>Estimated</Text>
+              </View>
+
+              {(popupBus.upcomingStops?.length ? popupBus.upcomingStops : [
+                {
+                  stopName: popupBus.nextStopName || "Waiting on next stop",
+                  scheduledTime: "--",
+                  estimatedTime: popupBus.etaToNextStop || "--",
+                },
+              ]).map((stop, index) => (
+                <View key={`${popupBus.id}-${stop.stopId || index}`} style={styles.busPopupRow}>
+                  <Text style={[styles.busPopupCell, styles.busPopupStopCell]}>{stop.stopName}</Text>
+                  <Text style={styles.busPopupCell}>{stop.scheduledTime || "--"}</Text>
+                  <Text style={styles.busPopupCell}>{stop.estimatedTime || "--"}</Text>
+                </View>
+              ))}
+            </View>
+          </View>
+        ) : null}
 
 
         <Animated.View style={[styles.sheet, { top: sheetY, bottom: 0 }]}>
           <View style={styles.handleArea} {...panResponder.panHandlers}>
             <View style={styles.handle} />
+            {(alerts.length ? alerts : TEST_ALERTS).length ? (
+              <AlertBanner
+                alerts={alerts.length ? alerts : TEST_ALERTS}
+                expanded={alertExpanded}
+                onPress={() => setAlertExpanded((value) => !value)}
+              />
+            ) : null}
             <View style={styles.tabs}>
               <Tab label="Routes" active={tab === "routes"} onPress={() => setTab("routes")} />
-              <Tab label="Messages" active={tab === "messages"} onPress={() => setTab("messages")} />
+              <Tab label="Settings" active={tab === "messages"} onPress={() => setTab("messages")} />
             </View>
           </View>
 
@@ -307,47 +542,23 @@ export default function App() {
             </ScrollView>
           ) : (
             <ScrollView style={styles.scroll} contentContainerStyle={styles.scrollInner} showsVerticalScrollIndicator={false}>
-              <Text style={styles.sectionTitle}>Messages</Text>
-              <Text style={styles.sectionSub}>Service alerts and arrival info show up here.</Text>
 
-              <View style={styles.panel}>
-                <Text style={styles.panelTitle}>Upcoming arrivals</Text>
-                {selectedStops.slice(0, 4).map((s, i) => (
-                  <View key={s.id} style={styles.arrivalRow}>
-                    <View>
-                      <Text style={styles.stopName}>{s.name}</Text>
-                      <Text style={styles.stopMeta}>
-                        {s.routeIds.slice(0, 2).join(", ") || primaryRoute?.shortName || "Route"} · Stop {i + 1}
-                      </Text>
-                    </View>
-                    <Text style={styles.eta}>{s.upcomingArrivals?.[0]?.label || `${6 + i * 3} min`}</Text>
-                  </View>
-                ))}
-              </View>
 
               <View style={styles.panel}>
                 <Text style={styles.panelTitle}>Arrival alerts</Text>
                 <Text style={styles.alertBody}>Notify me when a bus is within:</Text>
                 <View style={styles.distanceRow}>
-                  {[250, 500, 1000, 2000].map(d => (
+                  {[0, 250, 500, 1000, 2000].map(d => (
                     <Pressable
                       key={d}
                       onPress={() => setAlertDistance(d)}
                       style={[styles.distanceBtn, alertDistance === d && styles.distanceBtnActive]}
                     >
                       <Text style={[styles.distanceBtnText, alertDistance === d && styles.distanceBtnTextActive]}>
-                        {d >= 1000 ? `${d / 1000}km` : `${d}m`}
+                        {formatAlertDistance(d)}
                       </Text>
                     </Pressable>
                   ))}
-                </View>
-              </View>
-
-              <View style={styles.panel}>
-                <Text style={styles.panelTitle}>Service alerts</Text>
-                <View style={styles.alertBox}>
-                  <Text style={styles.alertTitle}>All clear</Text>
-                  <Text style={styles.alertBody}>No active alerts at the moment.</Text>
                 </View>
               </View>
             </ScrollView>
@@ -386,6 +597,26 @@ function BusMarker({ active, color }) {
   );
 }
 
+function AlertBanner({ alerts, expanded, onPress }) {
+  const text = useMemo(() => alerts.join("  •  "), [alerts]);
+
+  return (
+    <Pressable onPress={onPress} style={styles.alertBanner}>
+      <Text style={styles.alertBannerLabel}>Alert</Text>
+      <View style={styles.alertBannerTrack}>
+        <Text
+          numberOfLines={expanded ? 0 : 1}
+          ellipsizeMode="tail"
+          style={[styles.alertBannerText, expanded && styles.alertBannerTextExpanded]}
+        >
+          {text}
+        </Text>
+      </View>
+      <Text style={styles.alertBannerToggle}>{expanded ? "Hide" : "More"}</Text>
+    </Pressable>
+  );
+}
+
 const styles = StyleSheet.create({
   safe: {
     flex: 1,
@@ -394,8 +625,205 @@ const styles = StyleSheet.create({
   },
   container: { flex: 1, backgroundColor: "#0f172a" },
   map: { flex: 1 },
-
-
+  locateBtn: {
+    position: "absolute",
+    top: 18,
+    right: 18,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: "rgba(248,250,252,0.96)",
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#0f172a",
+    shadowOpacity: 0.16,
+    shadowOffset: { width: 0, height: 4 },
+    shadowRadius: 10,
+    elevation: 8,
+  },
+  locateBtnDisabled: {
+    opacity: 0.55,
+  },
+  compassBtn: {
+    position: "absolute",
+    top: 72,
+    right: 18,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: "rgba(248,250,252,0.96)",
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#0f172a",
+    shadowOpacity: 0.16,
+    shadowOffset: { width: 0, height: 4 },
+    shadowRadius: 10,
+    elevation: 8,
+  },
+  compassFace: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    borderWidth: 1.5,
+    borderColor: "#cbd5e1",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#ffffff",
+  },
+  compassNeedleWrap: {
+    width: 14,
+    height: 14,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  compassNeedleNorth: {
+    position: "absolute",
+    top: 0,
+    width: 0,
+    height: 0,
+    borderLeftWidth: 3,
+    borderRightWidth: 3,
+    borderBottomWidth: 7,
+    borderLeftColor: "transparent",
+    borderRightColor: "transparent",
+    borderBottomColor: "#ef4444",
+  },
+  compassNeedleSouth: {
+    position: "absolute",
+    bottom: 0,
+    width: 0,
+    height: 0,
+    borderLeftWidth: 3,
+    borderRightWidth: 3,
+    borderTopWidth: 7,
+    borderLeftColor: "transparent",
+    borderRightColor: "transparent",
+    borderTopColor: "#0f172a",
+  },
+  compassLabel: {
+    position: "absolute",
+    top: -10,
+    fontSize: 8,
+    fontWeight: "700",
+    color: "#0f172a",
+  },
+  busPopup: {
+    position: "absolute",
+    left: 18,
+    right: 18,
+    top: 132,
+    backgroundColor: "#ffffff",
+    borderRadius: 18,
+    overflow: "hidden",
+    shadowColor: "#0f172a",
+    shadowOpacity: 0.18,
+    shadowOffset: { width: 0, height: 8 },
+    shadowRadius: 16,
+    elevation: 10,
+  },
+  busPopupHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+  },
+  busPopupTitle: {
+    color: "#ffffff",
+    fontSize: 18,
+    fontWeight: "700",
+  },
+  busPopupSubtitle: {
+    color: "#ffffff",
+    fontSize: 16,
+    fontWeight: "700",
+    lineHeight: 20,
+  },
+  busPopupClose: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(255,255,255,0.14)",
+  },
+  busPopupCloseText: {
+    color: "#ffffff",
+    fontSize: 16,
+    fontWeight: "700",
+    textTransform: "uppercase",
+  },
+  busPopupBody: {
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+  },
+  busPopupMeta: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 10,
+  },
+  busPopupMetaLabel: {
+    color: "#64748b",
+    fontSize: 12,
+    fontWeight: "600",
+    textTransform: "uppercase",
+  },
+  busPopupMetaValue: {
+    color: "#0f172a",
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  busPopupTableHead: {
+    flexDirection: "row",
+    borderTopWidth: 1,
+    borderTopColor: "#e2e8f0",
+    borderBottomWidth: 1,
+    borderBottomColor: "#e2e8f0",
+    paddingVertical: 8,
+  },
+  busPopupHeadCell: {
+    flex: 1,
+    color: "#0f172a",
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  busPopupRow: {
+    flexDirection: "row",
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: "#f1f5f9",
+  },
+  busPopupCell: {
+    flex: 1,
+    color: "#334155",
+    fontSize: 12,
+    lineHeight: 16,
+  },
+  busPopupStopCell: {
+    flex: 1.7,
+    paddingRight: 10,
+  },
+  locateIcon: {
+    width: 18,
+    height: 18,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  locateIconRing: {
+    position: "absolute",
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    borderWidth: 2,
+    borderColor: "#2563eb",
+  },
+  locateIconDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: "#2563eb",
+  },
   busWrap: { alignItems: "center" },
   busWrapActive: { transform: [{ scale: 1.08 }] },
   busBody: {
@@ -433,6 +861,43 @@ const styles = StyleSheet.create({
   },
   handleArea: { paddingTop: 10, paddingHorizontal: 18, paddingBottom: 14, backgroundColor: "#f8fafc" },
   handle: { width: 56, height: 6, borderRadius: 999, alignSelf: "center", backgroundColor: "#cbd5e1", marginBottom: 14 },
+  alertBanner: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    backgroundColor: "#fff7ed",
+    borderWidth: 1,
+    borderColor: "#fed7aa",
+    borderRadius: 14,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    marginBottom: 12,
+    minHeight: 40,
+  },
+  alertBannerLabel: {
+    color: "#9a3412",
+    fontSize: 12,
+    fontWeight: "700",
+    marginRight: 10,
+  },
+  alertBannerTrack: {
+    flex: 1,
+    paddingRight: 8,
+  },
+  alertBannerText: {
+    color: "#7c2d12",
+    fontSize: 12,
+    fontWeight: "600",
+    lineHeight: 16,
+  },
+  alertBannerTextExpanded: {
+    lineHeight: 18,
+  },
+  alertBannerToggle: {
+    color: "#9a3412",
+    fontSize: 11,
+    fontWeight: "700",
+    paddingTop: 2,
+  },
   tabs: { flexDirection: "row", backgroundColor: "#e2e8f0", borderRadius: 16, padding: 4 },
   tab: { flex: 1, alignItems: "center", justifyContent: "center", paddingVertical: 12, borderRadius: 12 },
   tabActive: { backgroundColor: "#0f172a" },
