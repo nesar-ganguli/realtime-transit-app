@@ -234,6 +234,11 @@ const routes = routesCsv
   .sort((left, right) => left.shortName.localeCompare(right.shortName, undefined, { numeric: true }));
 
 const routeIdsInUse = new Set(routes.map((route) => route.id));
+const tripRouteById = Object.fromEntries(
+  tripRecords
+    .filter((trip) => trip.tripId && routeIdsInUse.has(trip.routeId))
+    .map((trip) => [trip.tripId, trip.routeId])
+);
 
 const stops = Object.values(stopsById)
   .map((stop) => ({
@@ -246,8 +251,8 @@ const stops = Object.values(stopsById)
 const output = `export const routes = ${JSON.stringify(routes, null, 2)};\n\nexport const stops = ${JSON.stringify(
   stops,
   null,
-  2
-)};\n`;
+2
+)};\n\nexport const tripRouteById = ${JSON.stringify(tripRouteById, null, 2)};\n`;
 
 const outputDir = path.join(process.cwd(), 'src', 'generated');
 const outputFile = path.join(outputDir, 'gtfsStaticData.js');

@@ -13,7 +13,8 @@ import {
 } from 'react-native';
 import MapView, { Circle, Marker, Polyline } from 'react-native-maps';
 
-import { routes, stops, vehicles } from './src/mock/transitData';
+import { routes, routesById, stops, stopsById, tripRouteById } from './src/services/gtfsStatic';
+import { startRealtimePolling } from './src/services/gtfsRealtime';
 
 const { height: screenHeight } = Dimensions.get('window');
 
@@ -47,16 +48,39 @@ export default function App() {
   const mapRef = useRef(null);
   const sheetTop = useRef(new Animated.Value(SHEET_MID_TOP)).current;
   const dragStart = useRef(SHEET_MID_TOP);
+  const hasTouchedRouteSelection = useRef(false);
 
   const [activeTab, setActiveTab] = useState('routes');
-  const [selectedRouteIds, setSelectedRouteIds] = useState(routes[0]?.id ? [routes[0].id] : []);
-  const [selectedBusId, setSelectedBusId] = useState(vehicles[0]?.id ?? null);
+  const [selectedRouteIds, setSelectedRouteIds] = useState([]);
+  const [vehicles, setVehicles] = useState([]);
+  const [realtimeError, setRealtimeError] = useState(null);
+  const [realtimeDebug, setRealtimeDebug] = useState(null);
+  const [selectedBusId, setSelectedBusId] = useState(null);
+
+  useEffect(() => {
+    const stopPolling = startRealtimePolling({
+      stopsById,
+      tripRouteById,
+      onUpdate: ({ vehicles: nextVehicles, debug }) => {
+        setRealtimeError(null);
+        setVehicles(nextVehicles);
+        setRealtimeDebug(debug);
+      },
+      onError: () => {
+        setRealtimeError('Realtime feed unavailable');
+        setVehicles([]);
+        setRealtimeDebug(null);
+      },
+    });
+
+    return stopPolling;
+  }, []);
 
   const selectedRoutes = useMemo(() => {
     const picked = routes.filter(
       (route) => selectedRouteIds.includes(route.id) && hasRenderableShape(route)
     );
-    const fallback = routes.find((route) => hasRenderableShape(route));
+    const fallback = selectedRouteIds.length ? routes.find((route) => hasRenderableShape(route)) : null;
     return picked.length ? picked : fallback ? [fallback] : [];
   }, [selectedRouteIds]);
 
@@ -73,12 +97,27 @@ export default function App() {
 
   const routeVehicles = useMemo(() => {
     if (!selectedRoutes.length) {
-      return [];
+      return vehicles;
     }
 
     const routeIds = new Set(selectedRoutes.map((route) => route.id));
-    return vehicles.filter((vehicle) => routeIds.has(vehicle.routeId));
-  }, [selectedRoutes]);
+    const filtered = vehicles.filter((vehicle) => routeIds.has(vehicle.routeId));
+    return filtered.length ? filtered : vehicles;
+  }, [selectedRoutes, vehicles]);
+
+  useEffect(() => {
+    if (hasTouchedRouteSelection.current || !vehicles.length) {
+      return;
+    }
+
+    const liveRouteIds = [...new Set(vehicles.map((vehicle) => vehicle.routeId))]
+      .filter((routeId) => routesById[routeId] && hasRenderableShape(routesById[routeId]))
+      .slice(0, 3);
+
+    if (liveRouteIds.length) {
+      setSelectedRouteIds(liveRouteIds);
+    }
+  }, [vehicles]);
 
   const selectedBus = useMemo(() => {
     const activeVehicle =
@@ -88,7 +127,8 @@ export default function App() {
   }, [routeVehicles, selectedBusId]);
 
   useEffect(() => {
-    if (!selectedRoutes.length) {
+    if (!routeVehicles.length) {
+      setSelectedBusId(null);
       return;
     }
 
@@ -100,6 +140,12 @@ export default function App() {
 
       return routeVehicles[0]?.id ?? null;
     });
+  }, [routeVehicles]);
+
+  useEffect(() => {
+    if (!selectedRoutes.length) {
+      return;
+    }
 
     const baseShapes = selectedRoutes.flatMap((route) =>
       route.shapeVariants?.length ? route.shapeVariants : [route.shape]
@@ -119,7 +165,7 @@ export default function App() {
         animated: true,
       });
     }
-  }, [routeVehicles, selectedRoutes]);
+  }, [selectedRoutes]);
 
   const panResponder = useMemo(
     () =>
@@ -161,6 +207,8 @@ export default function App() {
     if (!hasRenderableShape(route)) {
       return;
     }
+
+    hasTouchedRouteSelection.current = true;
 
     setSelectedRouteIds((current) => {
       if (current.includes(routeId)) {
@@ -269,8 +317,8 @@ export default function App() {
               >
                 <BusMarker
                   active={isActive}
-                  label={vehicle.routeId || 'BT'}
-                  color={`#${routes.find((route) => route.id === vehicle.routeId)?.color || '8b5a2b'}`}
+                  label={routesById[vehicle.routeId]?.shortName || 'BT'}
+                  color={`#${routesById[vehicle.routeId]?.color || '8b5a2b'}`}
                 />
               </Marker>
             );
@@ -290,10 +338,17 @@ export default function App() {
           <View>
             <Text style={styles.mapEyebrow}>Bloomington Transit</Text>
             <Text style={styles.mapTitle}>{titleLabel}</Text>
+            {realtimeDebug ? (
+              <Text style={styles.mapDebug}>
+                feed {realtimeDebug.positionEntities} • parsed {realtimeDebug.normalizedVehicles}
+              </Text>
+            ) : null}
           </View>
 
           <View style={styles.mapBadge}>
-            <Text style={styles.mapBadgeLabel}>{routeVehicles.length} live</Text>
+            <Text style={styles.mapBadgeLabel}>
+              {realtimeError ? 'feed down' : `${routeVehicles.length} live`}
+            </Text>
           </View>
         </View>
 
@@ -478,6 +533,11 @@ const styles = StyleSheet.create({
     fontSize: 20,
     fontWeight: '700',
     maxWidth: 220,
+  },
+  mapDebug: {
+    color: '#cbd5e1',
+    fontSize: 11,
+    marginTop: 4,
   },
   mapBadge: {
     backgroundColor: '#f8fafc',
