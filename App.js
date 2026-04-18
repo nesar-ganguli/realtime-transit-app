@@ -1,260 +1,159 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Animated,
-  Dimensions,
-  PanResponder,
-  Pressable,
-  SafeAreaView,
-  ScrollView,
-  StatusBar,
-  StyleSheet,
-  Text,
-  View,
-} from 'react-native';
-import MapView, { Circle, Marker, Polyline } from 'react-native-maps';
+  Animated, Dimensions, PanResponder, Platform,
+  Pressable, SafeAreaView, ScrollView, StatusBar,
+  StyleSheet, Text, View,
+} from "react-native";
+import MapView, { Circle, Marker, Polyline } from "react-native-maps";
 
-import { routes, routesById, stops, stopsById, tripRouteById } from './src/services/gtfsStatic';
-import { startRealtimePolling } from './src/services/gtfsRealtime';
+import { routes, routesById, stops, stopsById, tripRouteById } from "./src/services/gtfsStatic";
+import stopMarkerImages from "./src/generated/stopMarkerImages";
+import { startRealtimePolling } from "./src/services/gtfsRealtime";
 
-const { height: screenHeight } = Dimensions.get('window');
+const { height: screenHeight } = Dimensions.get("window");
 
-const SHEET_MAX_TOP = 110;
-const SHEET_MID_TOP = Math.round(screenHeight * 0.52);
-const SHEET_MIN_TOP = Math.round(screenHeight * 0.8);
-const SHEET_POSITIONS = [SHEET_MAX_TOP, SHEET_MID_TOP, SHEET_MIN_TOP];
+const SNAP_TOP = 110;
+const SNAP_MID = Math.round(screenHeight * 0.52);
+const SNAP_BOTTOM = Math.round(screenHeight * 0.8);
+const SNAPS = [SNAP_TOP, SNAP_MID, SNAP_BOTTOM];
 
-const sheetContentHeight = screenHeight - SHEET_MAX_TOP;
-
-const mapRegion = {
+const DEFAULT_REGION = {
   latitude: 39.1653,
   longitude: -86.5264,
   latitudeDelta: 0.06,
   longitudeDelta: 0.06,
 };
 
-const hasRenderableShape = (route) => {
-  if (!route) {
-    return false;
-  }
-
-  if (route.shapeVariants?.some((shape) => shape.length > 1)) {
-    return true;
-  }
-
+function canDraw(route) {
+  if (!route) return false;
+  if (route.shapeVariants?.some(s => s.length > 1)) return true;
   return Array.isArray(route.shape) && route.shape.length > 1;
-};
+}
 
 export default function App() {
   const mapRef = useRef(null);
-  const sheetTop = useRef(new Animated.Value(SHEET_MID_TOP)).current;
-  const dragStart = useRef(SHEET_MID_TOP);
-  const hasTouchedRouteSelection = useRef(false);
+  const sheetY = useRef(new Animated.Value(SNAP_MID)).current;
+  const dragStart = useRef(SNAP_MID);
+  const userPickedRoute = useRef(false);
 
-  const [activeTab, setActiveTab] = useState('routes');
-  const [selectedRouteIds, setSelectedRouteIds] = useState([]);
+  const [tab, setTab] = useState("routes");
+  const [selectedIds, setSelectedIds] = useState([]);
   const [vehicles, setVehicles] = useState([]);
-  const [realtimeError, setRealtimeError] = useState(null);
-  const [realtimeDebug, setRealtimeDebug] = useState(null);
-  const [selectedBusId, setSelectedBusId] = useState(null);
+  const [activeBusId, setActiveBusId] = useState(null);
 
   useEffect(() => {
-    const stopPolling = startRealtimePolling({
+    return startRealtimePolling({
       stopsById,
       tripRouteById,
-      onUpdate: ({ vehicles: nextVehicles, debug }) => {
-        setRealtimeError(null);
-        setVehicles(nextVehicles);
-        setRealtimeDebug(debug);
-      },
-      onError: () => {
-        setRealtimeError('Realtime feed unavailable');
-        setVehicles([]);
-        setRealtimeDebug(null);
-      },
+      onUpdate: ({ vehicles: v }) => { setVehicles(v); },
+      onError: () => { setVehicles([]); },
     });
-
-    return stopPolling;
   }, []);
 
   const selectedRoutes = useMemo(() => {
-    const picked = routes.filter(
-      (route) => selectedRouteIds.includes(route.id) && hasRenderableShape(route)
-    );
-    const fallback = selectedRouteIds.length ? routes.find((route) => hasRenderableShape(route)) : null;
-    return picked.length ? picked : fallback ? [fallback] : [];
-  }, [selectedRouteIds]);
+    const picked = routes.filter(r => selectedIds.includes(r.id) && canDraw(r));
+    if (picked.length) return picked;
+    if (selectedIds.length) {
+      const fallback = routes.find(r => canDraw(r));
+      return fallback ? [fallback] : [];
+    }
+    return [];
+  }, [selectedIds]);
 
   const primaryRoute = selectedRoutes[0] ?? null;
 
   const selectedStops = useMemo(() => {
-    if (!selectedRoutes.length) {
-      return [];
-    }
-
-    const stopIds = [...new Set(selectedRoutes.flatMap((route) => route.stops))];
-    return stopIds.map((stopId) => stops.find((stop) => stop.id === stopId)).filter(Boolean);
+    if (!selectedRoutes.length) return [];
+    const ids = [...new Set(selectedRoutes.flatMap(r => r.stops))];
+    return ids.map(id => stops.find(s => s.id === id)).filter(Boolean);
   }, [selectedRoutes]);
 
-  const routeVehicles = useMemo(() => {
-    if (!selectedRoutes.length) {
-      return vehicles;
-    }
-
-    const routeIds = new Set(selectedRoutes.map((route) => route.id));
-    const filtered = vehicles.filter((vehicle) => routeIds.has(vehicle.routeId));
+  const visibleVehicles = useMemo(() => {
+    if (!selectedIds.length) return [];
+    if (!selectedRoutes.length) return vehicles;
+    const ids = new Set(selectedRoutes.map(r => r.id));
+    const filtered = vehicles.filter(v => ids.has(v.routeId));
     return filtered.length ? filtered : vehicles;
-  }, [selectedRoutes, vehicles]);
+  }, [selectedIds, selectedRoutes, vehicles]);
+
+  const activeBus = useMemo(() => {
+    return visibleVehicles.find(v => v.id === activeBusId) ?? visibleVehicles[0] ?? null;
+  }, [visibleVehicles, activeBusId]);
 
   useEffect(() => {
-    if (hasTouchedRouteSelection.current || !vehicles.length) {
-      return;
-    }
-
-    const liveRouteIds = [...new Set(vehicles.map((vehicle) => vehicle.routeId))]
-      .filter((routeId) => routesById[routeId] && hasRenderableShape(routesById[routeId]))
-      .slice(0, 3);
-
-    if (liveRouteIds.length) {
-      setSelectedRouteIds(liveRouteIds);
-    }
-  }, [vehicles]);
-
-  const selectedBus = useMemo(() => {
-    const activeVehicle =
-      routeVehicles.find((vehicle) => vehicle.id === selectedBusId) ?? routeVehicles[0] ?? null;
-
-    return activeVehicle;
-  }, [routeVehicles, selectedBusId]);
-
-  useEffect(() => {
-    if (!routeVehicles.length) {
-      setSelectedBusId(null);
-      return;
-    }
-
-    setSelectedBusId((current) => {
-      const stillVisible = routeVehicles.some((vehicle) => vehicle.id === current);
-      if (stillVisible) {
-        return current;
-      }
-
-      return routeVehicles[0]?.id ?? null;
+    if (!visibleVehicles.length) { setActiveBusId(null); return; }
+    setActiveBusId(cur => {
+      const still = visibleVehicles.some(v => v.id === cur);
+      return still ? cur : (visibleVehicles[0]?.id ?? null);
     });
-  }, [routeVehicles]);
+  }, [visibleVehicles]);
 
   useEffect(() => {
-    if (!selectedRoutes.length) {
-      return;
-    }
-
-    const baseShapes = selectedRoutes.flatMap((route) =>
-      route.shapeVariants?.length ? route.shapeVariants : [route.shape]
+    if (!selectedRoutes.length) return;
+    const shapes = selectedRoutes.flatMap(r =>
+      r.shapeVariants?.length ? r.shapeVariants : [r.shape]
     );
+    const pts = shapes.flat()
+      .map(p => ({ latitude: p.lat, longitude: p.lon }))
+      .filter(p => isFinite(p.latitude) && isFinite(p.longitude));
 
-    const points = baseShapes
-      .flat()
-      .map((point) => ({
-        latitude: point.lat,
-        longitude: point.lon,
-      }))
-      .filter((point) => Number.isFinite(point.latitude) && Number.isFinite(point.longitude));
-
-    if (points.length > 1 && mapRef.current) {
-      mapRef.current.fitToCoordinates(points, {
+    if (pts.length > 1 && mapRef.current) {
+      mapRef.current.fitToCoordinates(pts, {
         edgePadding: { top: 130, right: 80, bottom: 320, left: 80 },
         animated: true,
       });
     }
   }, [selectedRoutes]);
 
-  const panResponder = useMemo(
-    () =>
-      PanResponder.create({
-        onMoveShouldSetPanResponder: (_, gesture) => Math.abs(gesture.dy) > 6,
-        onPanResponderGrant: () => {
-          sheetTop.stopAnimation((value) => {
-            dragStart.current = value;
-          });
-        },
-        onPanResponderMove: (_, gesture) => {
-          const next = dragStart.current + gesture.dy;
-          const clamped = Math.max(SHEET_MAX_TOP, Math.min(SHEET_MIN_TOP, next));
-          sheetTop.setValue(clamped);
-        },
-        onPanResponderRelease: (_, gesture) => {
-          const releasePoint = dragStart.current + gesture.dy;
-          const withMomentum = releasePoint + gesture.vy * 120;
-          const snapPoint = SHEET_POSITIONS.reduce((closest, candidate) => {
-            if (Math.abs(candidate - withMomentum) < Math.abs(closest - withMomentum)) {
-              return candidate;
-            }
+  const panResponder = useMemo(() => PanResponder.create({
+    onMoveShouldSetPanResponder: (_, g) => Math.abs(g.dy) > 6,
+    onPanResponderGrant: () => {
+      sheetY.stopAnimation(v => { dragStart.current = v; });
+    },
+    onPanResponderMove: (_, g) => {
+      sheetY.setValue(Math.max(SNAP_TOP, Math.min(SNAP_BOTTOM, dragStart.current + g.dy)));
+    },
+    onPanResponderRelease: (_, g) => {
+      const projected = dragStart.current + g.dy + g.vy * 120;
+      const snap = SNAPS.reduce((a, b) =>
+        Math.abs(b - projected) < Math.abs(a - projected) ? b : a
+      );
+      Animated.spring(sheetY, { toValue: snap, useNativeDriver: false, bounciness: 0 }).start();
+    },
+  }), [sheetY]);
 
-            return closest;
-          }, SHEET_POSITIONS[0]);
+  const liveRoutes = useMemo(() => {
+    const live = new Set(vehicles.map(v => v.routeId));
+    return routes.filter(r => live.has(r.id) && canDraw(r));
+  }, [vehicles]);
 
-          Animated.spring(sheetTop, {
-            toValue: snapPoint,
-            useNativeDriver: false,
-            bounciness: 0,
-          }).start();
-        },
-      }),
-    [sheetTop]
-  );
+  const allSelected = liveRoutes.every(r => selectedIds.includes(r.id));
 
-  const onRoutePress = (routeId) => {
-    const route = routes.find((item) => item.id === routeId);
-    if (!hasRenderableShape(route)) {
-      return;
-    }
-
-    hasTouchedRouteSelection.current = true;
-
-    setSelectedRouteIds((current) => {
-      if (current.includes(routeId)) {
-        if (current.length === 1) {
-          return current;
-        }
-
-        return current.filter((id) => id !== routeId);
-      }
-
-      return [...current, routeId];
-    });
-
-    Animated.spring(sheetTop, {
-      toValue: SHEET_MID_TOP,
-      useNativeDriver: false,
-      bounciness: 0,
-    }).start();
+  const toggleAll = () => {
+    userPickedRoute.current = true;
+    setSelectedIds(allSelected ? [] : liveRoutes.map(r => r.id));
   };
 
-  const onBusPress = (busId) => {
-    setSelectedBusId(busId);
+  const pickRoute = (id) => {
+    if (!canDraw(routes.find(r => r.id === id))) return;
+    userPickedRoute.current = true;
+    setSelectedIds(cur => cur.includes(id) ? cur.filter(x => x !== id) : [...cur, id]);
+    Animated.spring(sheetY, { toValue: SNAP_MID, useNativeDriver: false, bounciness: 0 }).start();
   };
 
-  const routeShapeVariants = selectedRoutes.flatMap((route) => {
-    const baseShapes = route.shapeVariants?.length ? route.shapeVariants : [route.shape];
-
-    return baseShapes.map((shape) => ({
-      routeId: route.id,
-      color: `#${route.color || '1565C0'}`,
-      points: shape.map((point) => ({
-        latitude: point.lat,
-        longitude: point.lon,
-      })),
+  const shapes = selectedRoutes.flatMap(r => {
+    const base = r.shapeVariants?.length ? r.shapeVariants : [r.shape];
+    return base.map(s => ({
+      routeId: r.id,
+      color: `#${r.color || "1565C0"}`,
+      points: s.map(p => ({ latitude: p.lat, longitude: p.lon })),
     }));
   });
 
-  const titleLabel =
-    selectedRoutes.length === 1
-      ? primaryRoute?.longName ?? 'Transit Map'
-      : `${selectedRoutes.length} routes selected`;
+  const mapKey = useMemo(() =>
+    selectedRoutes.map(r => r.id).sort().join("|") || "empty"
+  , [selectedRoutes]);
 
-  const mapSelectionKey = useMemo(() => {
-    const ids = selectedRoutes.map((route) => route.id).sort();
-    return ids.length ? ids.join('|') : 'empty';
-  }, [selectedRoutes]);
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -262,195 +161,133 @@ export default function App() {
 
       <View style={styles.container}>
         <MapView
-          key={mapSelectionKey}
+          key={mapKey}
           ref={mapRef}
           style={styles.map}
-          initialRegion={mapRegion}
+          initialRegion={DEFAULT_REGION}
           showsCompass={false}
         >
-          {routeShapeVariants.map((shape, index) =>
-            shape.points.length ? (
-                <Fragment key={`${shape.routeId}-${index}`}>
-                  <Polyline
-                    coordinates={shape.points}
-                    strokeColor="rgba(15, 23, 42, 0.35)"
-                    strokeWidth={10}
-                    lineCap="round"
-                    lineJoin="round"
-                  />
-                  <Polyline
-                  coordinates={shape.points}
-                  strokeColor={shape.color}
-                  strokeWidth={6}
-                  lineCap="round"
-                  lineJoin="round"
-                />
-                </Fragment>
-              ) : null
-          )}
+          {shapes.map((s, i) => s.points.length ? (
+            <Fragment key={`${s.routeId}-${i}`}>
+              <Polyline coordinates={s.points} strokeColor="rgba(15,23,42,0.3)" strokeWidth={5} lineCap="round" lineJoin="round" />
+              <Polyline coordinates={s.points} strokeColor={s.color} strokeWidth={3} lineCap="round" lineJoin="round" />
+            </Fragment>
+          ) : null)}
 
-          {selectedStops.map((stop) => (
-            <Marker
-              key={stop.id}
-              coordinate={{ latitude: stop.lat, longitude: stop.lon }}
-              title={stop.name}
-              anchor={{ x: 0.5, y: 0.5 }}
-            >
-              <View style={styles.stopOuter}>
-                <View style={styles.stopInner} />
-              </View>
-            </Marker>
-          ))}
-
-          {routeVehicles.map((vehicle) => {
-            const isActive = vehicle.id === selectedBus?.id;
-
+          {selectedStops.map(stop => {
+            const color = (
+              stop.routeIds.filter(id => selectedIds.includes(id)).map(id => routesById[id]?.color).find(Boolean) ||
+              stop.routeIds.map(id => routesById[id]?.color).find(Boolean) ||
+              "1565C0"
+            ).toUpperCase();
             return (
               <Marker
-                key={vehicle.id}
-                coordinate={{ latitude: vehicle.lat, longitude: vehicle.lon }}
-                title={vehicle.nextStopName || 'Transit vehicle'}
-                onPress={() => onBusPress(vehicle.id)}
+                key={stop.id}
+                coordinate={{ latitude: stop.lat, longitude: stop.lon }}
+                title={stop.name}
                 anchor={{ x: 0.5, y: 0.5 }}
-                flat
-                rotation={vehicle.bearing || 0}
-              >
-                <BusMarker
-                  active={isActive}
-                  label={routesById[vehicle.routeId]?.shortName || 'BT'}
-                  color={`#${routesById[vehicle.routeId]?.color || '8b5a2b'}`}
-                />
-              </Marker>
+                tracksViewChanges={false}
+                image={stopMarkerImages[color] ?? stopMarkerImages["1565C0"]}
+              />
             );
           })}
 
-          {selectedBus ? (
+          {visibleVehicles.map(v => (
+            <Marker
+              key={v.id}
+              coordinate={{ latitude: v.lat, longitude: v.lon }}
+              title={v.nextStopName || "Bus"}
+              onPress={() => setActiveBusId(v.id)}
+              anchor={{ x: 0.5, y: 0.5 }}
+              flat
+              rotation={v.bearing || 0}
+            >
+              <BusMarker
+                active={v.id === activeBus?.id}
+                color={`#${routesById[v.routeId]?.color || "8b5a2b"}`}
+              />
+            </Marker>
+          ))}
+
+          {activeBus && (
             <Circle
-              center={{ latitude: selectedBus.lat, longitude: selectedBus.lon }}
+              center={{ latitude: activeBus.lat, longitude: activeBus.lon }}
               radius={170}
-              fillColor="rgba(249, 168, 37, 0.18)"
-              strokeColor="rgba(249, 168, 37, 0.55)"
+              fillColor="rgba(249,168,37,0.18)"
+              strokeColor="rgba(249,168,37,0.55)"
             />
-          ) : null}
+          )}
         </MapView>
 
-        <View style={styles.mapHeader}>
-          <View>
-            <Text style={styles.mapEyebrow}>Bloomington Transit</Text>
-            <Text style={styles.mapTitle}>{titleLabel}</Text>
-            {realtimeDebug ? (
-              <Text style={styles.mapDebug}>
-                feed {realtimeDebug.positionEntities} • parsed {realtimeDebug.normalizedVehicles}
-              </Text>
-            ) : null}
-          </View>
 
-          <View style={styles.mapBadge}>
-            <Text style={styles.mapBadgeLabel}>
-              {realtimeError ? 'feed down' : `${routeVehicles.length} live`}
-            </Text>
-          </View>
-        </View>
-
-        <Animated.View style={[styles.sheet, { top: sheetTop, height: sheetContentHeight }]}>
-          <View style={styles.sheetHandleArea} {...panResponder.panHandlers}>
-            <View style={styles.sheetHandle} />
-            <View style={styles.sheetTabs}>
-              <SheetTab
-                label="Routes"
-                active={activeTab === 'routes'}
-                onPress={() => setActiveTab('routes')}
-              />
-              <SheetTab
-                label="Messages"
-                active={activeTab === 'messages'}
-                onPress={() => setActiveTab('messages')}
-              />
+        <Animated.View style={[styles.sheet, { top: sheetY, bottom: 0 }]}>
+          <View style={styles.handleArea} {...panResponder.panHandlers}>
+            <View style={styles.handle} />
+            <View style={styles.tabs}>
+              <Tab label="Routes" active={tab === "routes"} onPress={() => setTab("routes")} />
+              <Tab label="Messages" active={tab === "messages"} onPress={() => setTab("messages")} />
             </View>
           </View>
 
-          {activeTab === 'routes' ? (
-            <ScrollView
-              style={styles.sheetContent}
-              contentContainerStyle={styles.sheetContentInner}
-              showsVerticalScrollIndicator={false}
-            >
+          {tab === "routes" ? (
+            <ScrollView style={styles.scroll} contentContainerStyle={styles.scrollInner} showsVerticalScrollIndicator={false}>
               <Text style={styles.sectionTitle}>Pick a route</Text>
-              <Text style={styles.sectionIntro}>
-                Tap routes to add or remove them from the map. Selected routes, stops, and buses stay visible together.
-              </Text>
+              <Text style={styles.sectionSub}>Tap to add or remove routes. Stops and buses update automatically.</Text>
 
-              {routes.map((route) => {
-                const active = selectedRouteIds.includes(route.id);
-                const renderable = hasRenderableShape(route);
-                const routeStopCount = route.stops.length;
-                const routeBusCount = vehicles.filter((vehicle) => vehicle.routeId === route.id).length;
+              <Pressable style={styles.toggleAllBtn} onPress={toggleAll}>
+                <Text style={styles.toggleAllText}>{allSelected ? "Deselect All" : "Select All"}</Text>
+              </Pressable>
 
+              {liveRoutes.map(r => {
+                const active = selectedIds.includes(r.id);
+                const busCount = vehicles.filter(v => v.routeId === r.id).length;
                 return (
                   <Pressable
-                    key={route.id}
-                    onPress={() => onRoutePress(route.id)}
-                    style={[
-                      styles.routeCard,
-                      active && styles.routeCardActive,
-                      !renderable && styles.routeCardMuted,
-                    ]}
+                    key={r.id}
+                    onPress={() => pickRoute(r.id)}
+                    style={[styles.routeCard, active && styles.routeCardActive]}
                   >
-                    <View
-                      style={[
-                        styles.routeSwatch,
-                        { backgroundColor: `#${route.color || '1565C0'}` },
-                      ]}
-                    />
-                    <View style={styles.routeCardBody}>
+                    <View style={[styles.swatch, { backgroundColor: `#${r.color || "1565C0"}` }]} />
+                    <View style={{ flex: 1 }}>
                       <View style={styles.routeRow}>
-                        <Text style={styles.routeShort}>{route.shortName}</Text>
-                        <Text style={styles.routeBusCount}>
-                          {!renderable ? 'No shape' : active ? 'Selected' : `${routeBusCount} buses`}
-                        </Text>
+                        <Text style={styles.routeNum}>{r.shortName}</Text>
+                        <View style={styles.badges}>
+                          <Text style={styles.busBadge}>{busCount} {busCount === 1 ? "bus" : "buses"}</Text>
+                          {active && <Text style={styles.selectedBadge}>Selected</Text>}
+                        </View>
                       </View>
-                      <Text style={styles.routeLong}>{route.longName}</Text>
-                      <Text style={styles.routeMeta}>{routeStopCount} stops on this shape</Text>
+                      <Text style={styles.routeName}>{r.longName}</Text>
+                      <Text style={styles.routeMeta}>{r.stops.length} stops</Text>
                     </View>
                   </Pressable>
                 );
               })}
             </ScrollView>
           ) : (
-            <ScrollView
-              style={styles.sheetContent}
-              contentContainerStyle={styles.sheetContentInner}
-              showsVerticalScrollIndicator={false}
-            >
+            <ScrollView style={styles.scroll} contentContainerStyle={styles.scrollInner} showsVerticalScrollIndicator={false}>
               <Text style={styles.sectionTitle}>Messages</Text>
-              <Text style={styles.sectionIntro}>
-                Schedule rows and service notes stay here while the map remains visible underneath.
-              </Text>
+              <Text style={styles.sectionSub}>Service alerts and arrival info show up here.</Text>
 
-              <View style={styles.messagePanel}>
-                <Text style={styles.messagePanelTitle}>Upcoming arrivals</Text>
-                {selectedStops.slice(0, 4).map((stop, index) => (
-                  <View key={stop.id} style={styles.arrivalRow}>
+              <View style={styles.panel}>
+                <Text style={styles.panelTitle}>Upcoming arrivals</Text>
+                {selectedStops.slice(0, 4).map((s, i) => (
+                  <View key={s.id} style={styles.arrivalRow}>
                     <View>
-                      <Text style={styles.arrivalStop}>{stop.name}</Text>
-                      <Text style={styles.arrivalRoute}>
-                        {stop.routeIds.slice(0, 2).join(', ') || primaryRoute?.shortName || 'Route'} • Stop {index + 1}
+                      <Text style={styles.stopName}>{s.name}</Text>
+                      <Text style={styles.stopMeta}>
+                        {s.routeIds.slice(0, 2).join(", ") || primaryRoute?.shortName || "Route"} · Stop {i + 1}
                       </Text>
                     </View>
-                    <Text style={styles.arrivalEta}>
-                      {stop.upcomingArrivals?.[0]?.label || `${6 + index * 3} min`}
-                    </Text>
+                    <Text style={styles.eta}>{s.upcomingArrivals?.[0]?.label || `${6 + i * 3} min`}</Text>
                   </View>
                 ))}
               </View>
 
-              <View style={styles.messagePanel}>
-                <Text style={styles.messagePanelTitle}>Service messages</Text>
-                <View style={styles.noticeCard}>
-                  <Text style={styles.noticeTitle}>No active alerts right now</Text>
-                  <Text style={styles.noticeBody}>
-                    Live service notices and arrival alerts will appear here when the realtime layer lands.
-                  </Text>
+              <View style={styles.panel}>
+                <Text style={styles.panelTitle}>Service alerts</Text>
+                <View style={styles.alertBox}>
+                  <Text style={styles.alertTitle}>All clear</Text>
+                  <Text style={styles.alertBody}>No active alerts at the moment.</Text>
                 </View>
               </View>
             </ScrollView>
@@ -461,36 +298,29 @@ export default function App() {
   );
 }
 
-function SheetTab({ active, label, onPress }) {
+function Tab({ active, label, onPress }) {
   return (
-    <Pressable onPress={onPress} style={[styles.sheetTab, active && styles.sheetTabActive]}>
-      <Text style={[styles.sheetTabText, active && styles.sheetTabTextActive]}>{label}</Text>
+    <Pressable onPress={onPress} style={[styles.tab, active && styles.tabActive]}>
+      <Text style={[styles.tabText, active && styles.tabTextActive]}>{label}</Text>
     </Pressable>
   );
 }
 
-function BusMarker({ active, label, color }) {
+function BusMarker({ active, color }) {
   return (
-    <View style={[styles.busMarkerWrap, active && styles.busMarkerWrapActive]}>
-      <View
-        style={[
-          styles.busMarkerBody,
-          { backgroundColor: color || '#8b5a2b' },
-          active && styles.busMarkerBodyActive,
-        ]}
-      >
+    <View style={[styles.busWrap, active && styles.busWrapActive]}>
+      <View style={[styles.busBody, { backgroundColor: color || "#8b5a2b" }, active && styles.busBodyActive]}>
         <View style={styles.busGlyph}>
-          <View style={styles.busGlyphTop}>
-            <View style={styles.busGlyphWindow} />
-            <View style={styles.busGlyphWindow} />
+          <View style={styles.glyphTop}>
+            <View style={styles.glyphWindow} />
+            <View style={styles.glyphWindow} />
           </View>
-          <View style={styles.busGlyphDoor} />
-          <View style={styles.busGlyphWheels}>
-            <View style={styles.busGlyphWheel} />
-            <View style={styles.busGlyphWheel} />
+          <View style={styles.glyphDoor} />
+          <View style={styles.glyphWheels}>
+            <View style={styles.glyphWheel} />
+            <View style={styles.glyphWheel} />
           </View>
         </View>
-        <Text style={styles.busMarkerRoute}>{label}</Text>
       </View>
     </View>
   );
@@ -499,327 +329,105 @@ function BusMarker({ active, label, color }) {
 const styles = StyleSheet.create({
   safe: {
     flex: 1,
-    backgroundColor: '#0f172a',
+    backgroundColor: "#0f172a",
+    paddingTop: Platform.OS === "android" ? StatusBar.currentHeight : 0,
   },
-  container: {
-    flex: 1,
-    backgroundColor: '#0f172a',
+  container: { flex: 1, backgroundColor: "#0f172a" },
+  map: { flex: 1 },
+
+
+  busWrap: { alignItems: "center" },
+  busWrapActive: { transform: [{ scale: 1.08 }] },
+  busBody: {
+    width: 34, height: 34, borderRadius: 17,
+    borderWidth: 2.5, borderColor: "#f8fafc",
+    alignItems: "center", justifyContent: "center",
+    shadowColor: "#0f172a", shadowOpacity: 0.18,
+    shadowOffset: { width: 0, height: 3 }, shadowRadius: 8, elevation: 8,
   },
-  map: {
-    flex: 1,
-  },
-  mapHeader: {
-    position: 'absolute',
-    top: 18,
-    left: 18,
-    right: 18,
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'flex-start',
-    backgroundColor: 'rgba(15, 23, 42, 0.78)',
-    borderRadius: 24,
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-  },
-  mapEyebrow: {
-    color: '#bfdbfe',
-    fontSize: 12,
-    marginBottom: 3,
-    textTransform: 'uppercase',
-    letterSpacing: 1,
-  },
-  mapTitle: {
-    color: '#f8fafc',
-    fontSize: 20,
-    fontWeight: '700',
-    maxWidth: 220,
-  },
-  mapDebug: {
-    color: '#cbd5e1',
-    fontSize: 11,
-    marginTop: 4,
-  },
-  mapBadge: {
-    backgroundColor: '#f8fafc',
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 999,
-  },
-  mapBadgeLabel: {
-    color: '#0f172a',
-    fontWeight: '700',
-    fontSize: 12,
-  },
-  stopOuter: {
-    width: 14,
-    height: 14,
-    borderRadius: 7,
-    backgroundColor: '#f8fafc',
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderWidth: 2,
-    borderColor: '#0f172a',
-  },
-  stopInner: {
-    width: 4,
-    height: 4,
-    borderRadius: 2,
-    backgroundColor: '#0f172a',
-  },
-  busMarkerWrap: {
-    alignItems: 'center',
-  },
-  busMarkerWrapActive: {
-    transform: [{ scale: 1.08 }],
-  },
-  busMarkerBody: {
-    width: 34,
-    height: 34,
-    borderRadius: 17,
-    backgroundColor: '#8b5a2b',
-    borderWidth: 2.5,
-    borderColor: '#f8fafc',
-    alignItems: 'center',
-    justifyContent: 'center',
-    shadowColor: '#0f172a',
-    shadowOpacity: 0.18,
-    shadowOffset: { width: 0, height: 3 },
-    shadowRadius: 8,
-    elevation: 8,
-  },
-  busMarkerBodyActive: {
-    borderColor: '#ffffff',
-  },
-  busGlyph: {
-    width: 15,
-    alignItems: 'center',
-  },
-  busGlyphTop: {
-    width: 15,
-    height: 7,
-    borderTopLeftRadius: 3,
-    borderTopRightRadius: 3,
-    backgroundColor: '#f8fafc',
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-evenly',
+  busBodyActive: { borderColor: "#fff" },
+  busGlyph: { width: 15, alignItems: "center" },
+  glyphTop: {
+    width: 15, height: 7,
+    borderTopLeftRadius: 3, borderTopRightRadius: 3,
+    backgroundColor: "#f8fafc",
+    flexDirection: "row", alignItems: "center", justifyContent: "space-evenly",
     marginBottom: 1,
   },
-  busGlyphWindow: {
-    width: 4,
-    height: 3,
-    borderRadius: 1,
-    backgroundColor: '#ffffff',
+  glyphWindow: { width: 4, height: 3, borderRadius: 1, backgroundColor: "#fff" },
+  glyphDoor: {
+    width: 15, height: 6,
+    borderBottomLeftRadius: 2, borderBottomRightRadius: 2,
+    backgroundColor: "#f8fafc", marginBottom: 1,
   },
-  busGlyphDoor: {
-    width: 15,
-    height: 6,
-    borderBottomLeftRadius: 2,
-    borderBottomRightRadius: 2,
-    backgroundColor: '#f8fafc',
-    marginBottom: 1,
-  },
-  busGlyphWheels: {
-    width: 15,
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginTop: -1,
-  },
-  busGlyphWheel: {
-    width: 3,
-    height: 3,
-    borderRadius: 2,
-    backgroundColor: '#f8fafc',
-  },
-  busMarkerRoute: {
-    position: 'absolute',
-    bottom: -14,
-    minWidth: 22,
-    paddingHorizontal: 5,
-    paddingVertical: 2,
-    borderRadius: 999,
-    backgroundColor: 'rgba(15, 23, 42, 0.84)',
-    color: '#f8fafc',
-    fontSize: 8,
-    fontWeight: '700',
-    textAlign: 'center',
-  },
+  glyphWheels: { width: 15, flexDirection: "row", justifyContent: "space-between", marginTop: -1 },
+  glyphWheel: { width: 3, height: 3, borderRadius: 2, backgroundColor: "#f8fafc" },
+
   sheet: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    backgroundColor: '#f8fafc',
-    borderTopLeftRadius: 30,
-    borderTopRightRadius: 30,
-    overflow: 'hidden',
-    shadowColor: '#0f172a',
-    shadowOpacity: 0.22,
-    shadowOffset: { width: 0, height: -10 },
-    shadowRadius: 24,
-    elevation: 18,
+    position: "absolute", left: 0, right: 0,
+    backgroundColor: "#f8fafc",
+    borderTopLeftRadius: 30, borderTopRightRadius: 30,
+    overflow: "hidden",
+    shadowColor: "#0f172a", shadowOpacity: 0.22,
+    shadowOffset: { width: 0, height: -10 }, shadowRadius: 24, elevation: 18,
   },
-  sheetHandleArea: {
-    paddingTop: 10,
-    paddingHorizontal: 18,
-    paddingBottom: 14,
-    backgroundColor: '#f8fafc',
+  handleArea: { paddingTop: 10, paddingHorizontal: 18, paddingBottom: 14, backgroundColor: "#f8fafc" },
+  handle: { width: 56, height: 6, borderRadius: 999, alignSelf: "center", backgroundColor: "#cbd5e1", marginBottom: 14 },
+  tabs: { flexDirection: "row", backgroundColor: "#e2e8f0", borderRadius: 16, padding: 4 },
+  tab: { flex: 1, alignItems: "center", justifyContent: "center", paddingVertical: 12, borderRadius: 12 },
+  tabActive: { backgroundColor: "#0f172a" },
+  tabText: { color: "#334155", fontWeight: "600" },
+  tabTextActive: { color: "#f8fafc" },
+
+  scroll: { flex: 1 },
+  scrollInner: { paddingHorizontal: 18, paddingBottom: 40 },
+  sectionTitle: { color: "#0f172a", fontSize: 22, fontWeight: "700", marginBottom: 6 },
+  sectionSub: { color: "#64748b", fontSize: 14, lineHeight: 20, marginBottom: 18 },
+
+  toggleAllBtn: {
+    alignSelf: "flex-end",
+    backgroundColor: "#0f172a",
+    paddingHorizontal: 16, paddingVertical: 8,
+    borderRadius: 999, marginBottom: 14,
   },
-  sheetHandle: {
-    width: 56,
-    height: 6,
-    borderRadius: 999,
-    alignSelf: 'center',
-    backgroundColor: '#cbd5e1',
-    marginBottom: 14,
-  },
-  sheetTabs: {
-    flexDirection: 'row',
-    backgroundColor: '#e2e8f0',
-    borderRadius: 16,
-    padding: 4,
-  },
-  sheetTab: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingVertical: 12,
-    borderRadius: 12,
-  },
-  sheetTabActive: {
-    backgroundColor: '#0f172a',
-  },
-  sheetTabText: {
-    color: '#334155',
-    fontWeight: '600',
-  },
-  sheetTabTextActive: {
-    color: '#f8fafc',
-  },
-  sheetContent: {
-    flex: 1,
-  },
-  sheetContentInner: {
-    paddingHorizontal: 18,
-    paddingBottom: 40,
-  },
-  sectionTitle: {
-    color: '#0f172a',
-    fontSize: 22,
-    fontWeight: '700',
-    marginBottom: 6,
-  },
-  sectionIntro: {
-    color: '#64748b',
-    fontSize: 14,
-    lineHeight: 20,
-    marginBottom: 18,
-  },
+  toggleAllText: { color: "#f8fafc", fontSize: 13, fontWeight: "700" },
+
   routeCard: {
-    flexDirection: 'row',
-    alignItems: 'stretch',
-    backgroundColor: '#ffffff',
-    borderRadius: 22,
-    padding: 14,
-    marginBottom: 12,
-    borderWidth: 1,
-    borderColor: '#e2e8f0',
+    flexDirection: "row", alignItems: "stretch",
+    backgroundColor: "#fff", borderRadius: 22,
+    padding: 14, marginBottom: 12,
+    borderWidth: 1, borderColor: "#e2e8f0",
   },
-  routeCardActive: {
-    borderColor: '#0f172a',
-    backgroundColor: '#eff6ff',
+  routeCardActive: { borderColor: "#0f172a", backgroundColor: "#eff6ff" },
+  swatch: { width: 12, borderRadius: 999, marginRight: 14 },
+  routeRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 4 },
+  routeNum: { color: "#0f172a", fontSize: 24, fontWeight: "700" },
+  badges: { flexDirection: "row", alignItems: "center", gap: 6 },
+  busBadge: {
+    color: "#1d4ed8", fontSize: 12, fontWeight: "700",
+    backgroundColor: "#dbeafe", paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999,
   },
-  routeCardMuted: {
-    opacity: 0.65,
+  selectedBadge: {
+    color: "#166534", fontSize: 12, fontWeight: "700",
+    backgroundColor: "#dcfce7", paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999,
   },
-  routeSwatch: {
-    width: 12,
-    borderRadius: 999,
-    marginRight: 14,
+  routeName: { color: "#1e293b", fontSize: 16, fontWeight: "600", marginBottom: 4 },
+  routeMeta: { color: "#64748b", fontSize: 13 },
+
+  panel: {
+    backgroundColor: "#fff", borderRadius: 22,
+    padding: 16, marginBottom: 14,
+    borderWidth: 1, borderColor: "#e2e8f0",
   },
-  routeCardBody: {
-    flex: 1,
-  },
-  routeRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 4,
-  },
-  routeShort: {
-    color: '#0f172a',
-    fontSize: 24,
-    fontWeight: '700',
-  },
-  routeBusCount: {
-    color: '#1d4ed8',
-    fontSize: 12,
-    fontWeight: '700',
-    backgroundColor: '#dbeafe',
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: 999,
-  },
-  routeLong: {
-    color: '#1e293b',
-    fontSize: 16,
-    fontWeight: '600',
-    marginBottom: 4,
-  },
-  routeMeta: {
-    color: '#64748b',
-    fontSize: 13,
-  },
-  messagePanel: {
-    backgroundColor: '#ffffff',
-    borderRadius: 22,
-    padding: 16,
-    marginBottom: 14,
-    borderWidth: 1,
-    borderColor: '#e2e8f0',
-  },
-  messagePanelTitle: {
-    color: '#0f172a',
-    fontSize: 18,
-    fontWeight: '700',
-    marginBottom: 14,
-  },
+  panelTitle: { color: "#0f172a", fontSize: 18, fontWeight: "700", marginBottom: 14 },
   arrivalRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingVertical: 10,
-    borderTopWidth: 1,
-    borderTopColor: '#e2e8f0',
+    flexDirection: "row", justifyContent: "space-between", alignItems: "center",
+    paddingVertical: 10, borderTopWidth: 1, borderTopColor: "#e2e8f0",
   },
-  arrivalStop: {
-    color: '#0f172a',
-    fontSize: 15,
-    fontWeight: '600',
-    marginBottom: 3,
-  },
-  arrivalRoute: {
-    color: '#64748b',
-    fontSize: 12,
-  },
-  arrivalEta: {
-    color: '#1d4ed8',
-    fontSize: 15,
-    fontWeight: '700',
-  },
-  noticeCard: {
-    backgroundColor: '#f8fafc',
-    borderRadius: 18,
-    padding: 14,
-  },
-  noticeTitle: {
-    color: '#0f172a',
-    fontSize: 15,
-    fontWeight: '700',
-    marginBottom: 5,
-  },
-  noticeBody: {
-    color: '#64748b',
-    fontSize: 13,
-    lineHeight: 19,
-  },
+  stopName: { color: "#0f172a", fontSize: 15, fontWeight: "600", marginBottom: 3 },
+  stopMeta: { color: "#64748b", fontSize: 12 },
+  eta: { color: "#1d4ed8", fontSize: 15, fontWeight: "700" },
+  alertBox: { backgroundColor: "#f8fafc", borderRadius: 18, padding: 14 },
+  alertTitle: { color: "#0f172a", fontSize: 15, fontWeight: "700", marginBottom: 5 },
+  alertBody: { color: "#64748b", fontSize: 13, lineHeight: 19 },
 });
